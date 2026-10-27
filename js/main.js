@@ -6,7 +6,7 @@ import { EARTH, MOON, BASE_DIR, PAD_DIR, ORES, ORE_KEYS, SUN_DIR, buildWorld, su
 import { PARTS, SHIP_SCALE, makeMaterials, buildPartMesh, computeStats } from './parts.js';
 import { createHangar } from './hangar.js';
 import { createBase, GOODS, IMPORTS, EXPORTS } from './base.js';
-import { cloud, cloudLogin, cloudRegister, cloudResume, cloudPush, cloudPull, cloudLogout } from './cloud.js';
+import { cloud, cloudLogin, cloudRegister, cloudResume, cloudPush, cloudPull, cloudLogout, cloudBoard } from './cloud.js';
 
 // ---------------- utilitaires ----------------
 const V = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
@@ -1193,12 +1193,13 @@ function renderSave(body) {
   const code = inGame ? encodeSave(makeSave()) : '';
   let h = '';
   // --- compte pilote (cloud) ---
+  h += '<div class="section-t">Classement · argent total gagné</div><div id="board-modal" class="board"></div>';
   h += '<div class="section-t">Compte pilote (sauvegarde en ligne)</div>';
   if (!cloud.enabled) {
-    h += '<div class="news wrap warn-n">Sauvegarde en ligne non configurée (guide : cloud/README.md). La sauvegarde automatique locale reste active.</div>';
+    h += '<div class="news wrap warn-n">Sauvegarde en ligne indisponible pour le moment. La sauvegarde automatique locale reste active.</div>';
   } else if (cloud.account) {
     const last = cloud.lastSync ? new Date(cloud.lastSync).toLocaleString('fr-FR') : '—';
-    h += `<div class="row"><div><div class="t">Connecté : ${cloud.account}</div><div class="d">Sauvegarde automatique sur GitHub toutes les 20 s · dernière synchro : ${last}${cloud.syncing ? ' · envoi en cours…' : ''}</div></div><div class="v"></div><button class="btn" id="sv-logout">Quitter le compte</button></div>`;
+    h += `<div class="row"><div><div class="t">Connecté : ${cloud.account}</div><div class="d">Sauvegarde automatique sur GitHub toutes les 90 s · dernière synchro : ${last}${cloud.syncing ? ' · envoi en cours…' : ''}</div></div><div class="v"></div><button class="btn" id="sv-logout">Quitter le compte</button></div>`;
     if (cloud.conflict) {
       h += `<div class="news wrap warn-n">Conflit : une version plus récente existe sur le cloud.</div>`;
     } else if (cloud.hold) {
@@ -1232,8 +1233,9 @@ function renderSave(body) {
     <div class="row"><div><div class="t">Depuis un fichier</div><div class="d">Sélectionne un fichier .json exporté depuis Astro-Mineur.</div></div><div class="v"></div><label class="btn">Choisir un fichier<input type="file" id="sv-file" accept=".json,application/json,text/plain" hidden></label></div>
     <textarea id="sv-in" class="code" placeholder="…ou colle ici un code de sauvegarde (AM1.…)" spellcheck="false"></textarea>
     <button class="btn-primary" id="sv-load">Charger ce code</button>
-    <p class="note">Sauvegarde automatique : locale toutes les 20 s, cloud toutes les 20 s si un compte pilote est connecté. Charger une partie remplace la progression en cours.</p>`;
+    <p class="note">Sauvegarde automatique : locale toutes les 20 s, cloud toutes les 90 s si un compte pilote est connecté. Charger une partie remplace la progression en cours.</p>`;
   body.innerHTML = h;
+  renderBoard(body.querySelector('#board-modal'));
   const err = m => toast(m, 'bad');
   const lg = body.querySelector('#sv-login'); if (lg) lg.onclick = () => { closeModal(); openLogin(); };
   const lo = body.querySelector('#sv-logout'); if (lo) lo.onclick = () => { cloudLogout(); refreshTop(); toast('Déconnecté. Sauvegarde locale automatique maintenue.', 'ok'); rerenderModal(); };
@@ -1281,7 +1283,9 @@ function autoSaveLocal() {
   if (mode === 'title') return;
   try { localStorage.setItem(localSlot(), encodeSave(makeSave())); } catch (e) {}
 }
+let lastCloudAuto = 0;
 function autoSaveCloud(opts = {}) {
+  if (!opts.manual && !opts.keepalive && !opts.force) { if (Date.now() - lastCloudAuto < 90000) return; lastCloudAuto = Date.now(); }
   if (mode === 'title' || !cloud.enabled || !cloud.account || cloud.busy || cloud.syncing) return;
   if ((cloud.conflict || cloud.hold) && !opts.force) {
     if (opts.manual) toast(cloud.conflict ? 'Conflit cloud : une version plus récente existe. Menu Sauver (P) pour choisir.' : 'Compte connecté — menu Sauver (P) pour récupérer ou envoyer la partie.', 'warn');
@@ -1314,7 +1318,7 @@ function refreshLoginView() {
   const form = $('#login-form'), on = $('#login-on'), note = $('#lg-note');
   if (!cloud.enabled) {
     form.classList.add('hidden'); on.classList.add('hidden');
-    if (note) note.innerHTML = 'Sauvegarde en ligne non configurée.<br>Suis le guide <b>cloud/README.md</b> pour l’activer — la sauvegarde automatique locale fonctionne déjà.';
+    if (note) note.innerHTML = 'Sauvegarde en ligne indisponible. La sauvegarde automatique locale fonctionne déjà.';
     return;
   }
   note.innerHTML = '';
@@ -1345,7 +1349,11 @@ $('#lg-connect').addEventListener('click', async () => {
     sfx('coin');
     if (mode !== 'title') toast(`Connecté : ${id}. Menu Sauver (P) pour récupérer la partie du compte ou envoyer celle en cours.`, 'warn');
     else toast(d && d.save ? `Connecté : ${id}. Clique sur « Reprendre ma partie ».` : `Connecté : ${id}. Compte neuf, aucune partie cloud.`, 'ok');
-  } catch (e) { st.textContent = e.message; }
+    renderBoard($('#board-title'));
+  } catch (e) {
+    if (e.status === 404) { $('#lg-create').click(); return; } // compte inconnu : création automatique
+    st.textContent = e.message;
+  }
 });
 $('#lg-create').addEventListener('click', async () => {
   const id = $('#lg-id').value.trim(), pin = $('#lg-pin').value.trim();
@@ -1359,6 +1367,7 @@ $('#lg-create').addEventListener('click', async () => {
     refreshLoginView(); refreshTop();
     sfx('coin');
     toast(`Compte créé : ${id}. Sauvegarde automatique sur GitHub activée.`, 'ok');
+    renderBoard($('#board-title'));
   } catch (e) { st.textContent = e.message; }
 });
 $('#lg-play').addEventListener('click', async () => {
@@ -1377,6 +1386,20 @@ $('#lg-pin').addEventListener('keydown', e => { if (e.key === 'Enter') $('#lg-co
 $('#lg-id').addEventListener('keydown', e => { if (e.key === 'Enter') $('#lg-pin').focus(); });
 // reconnexion silencieuse si une session existe
 if (cloud.enabled) cloudResume().then(() => { refreshTop(); });
+// ---- classement top 5 (argent total gagné) ----
+const escB = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+async function renderBoard(el) {
+  if (!el) return;
+  if (!cloud.enabled) { el.innerHTML = ''; return; }
+  const top = await cloudBoard();
+  const me = (cloud.account || '').toLowerCase();
+  el.innerHTML = '<div class="bd-h">🏆 Top 5 · argent total gagné</div>' + (top.length
+    ? top.map((p, i) => `<div class="bd-r${String(p.id).toLowerCase() === me ? ' me' : ''}"><i>${i + 1}</i><span>${escB(p.id)}</span><b>${Math.round(p.e).toLocaleString('fr-FR')} ¢</b></div>`).join('')
+    : '<div class="bd-r"><span>Aucun score pour l’instant — sois le premier !</span></div>');
+}
+renderBoard($('#board-title'));
+setInterval(() => { if (mode === 'title') renderBoard($('#board-title')); }, 60000);
+const bb = $('#btn-board'); if (bb) bb.addEventListener('click', () => $('#btn-save').click());
 
 // ---------------- OBJECTIFS ----------------
 const OBJECTIVES = [

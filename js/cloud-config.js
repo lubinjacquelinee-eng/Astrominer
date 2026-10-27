@@ -1,14 +1,8 @@
 // ============================================================
-//  SAUVEGARDE EN LIGNE — configuration
+//  SAUVEGARDE EN LIGNE — à configurer UNE SEULE FOIS par toi (voir cloud/README.md)
+//  Les joueurs, eux, n'ont qu'un identifiant + un code à 4 chiffres.
+//    repo   : dépôt GitHub (privé) qui reçoit les parties, ex. 'TON-PSEUDO/astro-mineur-saves'
+//    branch : branche du dépôt (main)
+//    tk     : ton jeton GitHub ÉCRIT À L'ENVERS (évite sa révocation automatique)
 // ============================================================
-//  Ce fichier configure le "compte pilote" (identifiant + code à 4 chiffres)
-//  qui sauvegarde ta partie sur GitHub via un petit service gratuit.
-//
-//  MODE HORS-LIGNE (par défaut) : laisse api: ''.
-//    → sauvegarde automatique locale (navigateur) toutes les 20 s,
-//    → plus l'export/import manuel (fichier ou code) comme avant.
-//
-//  MODE EN LIGNE : suis le guide cloud/README.md (5 minutes, gratuit),
-//    puis colle ici l'adresse de ton service, par exemple :
-//    api: 'https://astro-mineur-saves.ton-pseudo.workers.dev'
-window.ASTRO_CLOUD = { api: '' };
+window.ASTRO_CLOUD = { repo: '', branch: 'main', tk: '' };

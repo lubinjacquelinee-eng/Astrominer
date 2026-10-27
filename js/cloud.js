@@ -9,10 +9,11 @@
 //  compte), la réponse est périmée et ne doit RIEN modifier — ni l'état
 //  (conflit, hold, session), ni le propriétaire de la partie en cours.
 
-const CFG = (window.ASTRO_CLOUD && window.ASTRO_CLOUD.api) || '';
-const API = String(CFG).replace(/\/+$/, '');
+const C = window.ASTRO_CLOUD || {};
+const REPO = C.repo || '', BRANCH = C.branch || 'main';
+const TOKEN = C.tk ? String(C.tk).split('').reverse().join('') : ''; // jeton écrit à l'envers (voir README)
+const API = (REPO && TOKEN) ? 'github' : '';
 const SESSION_KEY = 'am2-cloud-session';
-
 export const cloud = {
   enabled: !!API,
   account: null,   // identifiant connecté
@@ -46,22 +47,108 @@ function saveSession(id, pin) {
 }
 function clearSession() { try { localStorage.removeItem(SESSION_KEY); } catch (e) {} }
 
-async function request(path, body, opts = {}) {
-  if (!API) throw new Error('cloud désactivé');
-  const res = await fetch(API + path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body || {}),
-    keepalive: !!opts.keepalive,
+// ---- accès direct à l'API GitHub (plus aucun serveur intermédiaire) ----
+const GHB = 'https://api.github.com/repos/' + REPO + '/contents/';
+const shas = {};
+const enc = t => btoa(unescape(encodeURIComponent(t)));
+const dec = t => decodeURIComponent(escape(atob(t.replace(/\s/g, ''))));
+function herr(m, status) { const e = new Error(m); e.status = status; return e; }
+async function sha256(t) {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t));
+  return [...new Uint8Array(d)].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+function gh(path, init = {}) {
+  const put = init.method === 'PUT';
+  return fetch(GHB + path + (put ? '' : '?ref=' + encodeURIComponent(BRANCH) + '&t=' + Date.now()), {
+    ...init, cache: 'no-store',
+    headers: { Authorization: 'Bearer ' + TOKEN, Accept: 'application/vnd.github+json', ...(init.body ? { 'Content-Type': 'application/json' } : {}) },
   });
-  let data = null;
-  try { data = await res.json(); } catch (e) { data = null; }
-  if (!res.ok) {
-    const err = new Error((data && data.error) || `erreur ${res.status}`);
-    err.status = res.status;
-    throw err;
+}
+async function ghRead(path) {
+  const r = await gh(path);
+  if (r.status === 404) { delete shas[path]; return null; }
+  if (!r.ok) throw herr('GitHub inaccessible (' + r.status + ')', r.status);
+  const j = await r.json(); shas[path] = j.sha;
+  return JSON.parse(dec(j.content));
+}
+async function ghWrite(path, obj, msg, keepalive) {
+  const body = { message: msg, content: enc(JSON.stringify(obj)), branch: BRANCH };
+  if (shas[path]) body.sha = shas[path];
+  const r = await gh(path, { method: 'PUT', body: JSON.stringify(body), keepalive: !!keepalive });
+  if (r.status === 409 || r.status === 422) throw herr('conflit', 409);
+  if (!r.ok) throw herr('écriture GitHub impossible (' + r.status + ')', r.status);
+  const j = await r.json(); shas[path] = j.content.sha;
+}
+const earned = sv => Math.max(0, Math.floor((sv && sv.state && sv.state.earned) || 0));
+
+// ---- classement : leaderboard.json { p: { id: { n, e, t } } } ----
+const BOARD = 'leaderboard.json';
+let boardT = 0, boardCache = null, boardCacheT = 0;
+async function boardPush(id, name, total, force) {
+  const now = Date.now();
+  if (!force && now - boardT < 150000) return;
+  boardT = now;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const b = (await ghRead(BOARD)) || { p: {} };
+      if (b.p[id] && b.p[id].e >= total) return;
+      b.p[id] = { n: name, e: total, t: now };
+      b.p = Object.fromEntries(Object.entries(b.p).sort((x, y) => y[1].e - x[1].e).slice(0, 50));
+      b.t = now;
+      if (!b.p[id]) return;
+      await ghWrite(BOARD, b, 'board ' + id);
+      boardCache = b; boardCacheT = now; return;
+    } catch (e) { if (e.status !== 409) return; }
   }
-  return data;
+}
+export async function cloudBoard() {
+  if (!cloud.enabled) return [];
+  if (!boardCache || Date.now() - boardCacheT > 30000) {
+    try { boardCache = (await ghRead(BOARD)) || { p: {} }; boardCacheT = Date.now(); } catch (e) {}
+  }
+  return Object.entries((boardCache && boardCache.p) || {}).sort((x, y) => y[1].e - x[1].e).slice(0, 5)
+    .map(([id, v]) => ({ id: v.n || id, e: v.e }));
+}
+
+// Émule les 3 routes de l'ancien service : /register, /login, /save
+async function request(path, b, opts = {}) {
+  if (!API) throw new Error('cloud désactivé');
+  const id = String(b.id || '').toLowerCase(), file = 'saves/' + id + '.json';
+  const h = await sha256(id + ':' + b.pin + ':astro-mineur:' + REPO);
+  if (path === '/register') {
+    if (await ghRead(file)) throw herr('Identifiant déjà pris', 409);
+    const t = Date.now(), total = earned(b.save);
+    await ghWrite(file, { h, t, total, save: b.save || null }, 'create ' + id);
+    boardPush(id, b.id, total, true);
+    return { ok: true, t };
+  }
+  if (path === '/login') {
+    const f = await ghRead(file);
+    if (!f) throw herr('Compte inconnu', 404);
+    if (f.h !== h) throw herr('Code incorrect', 401);
+    return { save: f.save || null, t: f.t || null };
+  }
+  if (path === '/save') {
+    const inT = (typeof b.save.t === 'number') ? b.save.t : Date.now();
+    const total = earned(b.save);
+    const check = async () => {
+      const f = await ghRead(file);
+      if (!f) throw herr('Compte inconnu', 404);
+      if (f.h !== h) throw herr('Code incorrect', 401);
+      if (!b.force && (f.t || 0) >= inT) throw herr('conflit', 409);
+    };
+    if (!shas[file]) await check();
+    const t = Date.now(), rec = { h, t, total, save: b.save };
+    try { await ghWrite(file, rec, 'save ' + id, opts.keepalive); }
+    catch (e) {
+      if (e.status !== 409) throw e;
+      await check(); // quelqu'un d'autre a écrit entre-temps
+      await ghWrite(file, rec, 'save ' + id);
+    }
+    boardPush(id, b.id, total, false);
+    return { ok: true, t };
+  }
+  throw new Error('route inconnue');
 }
 
 const RE_ID = /^[a-zA-Z0-9_-]{3,16}$/;

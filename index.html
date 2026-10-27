@@ -30,8 +30,9 @@
       <button id="btn-start" class="menu-item primary"><i>01</i><span>Nouvelle partie</span><em>Entrer dans le hangar</em></button>
       <button id="btn-load" class="menu-item"><i>02</i><span>Charger une partie</span><em>Fichier ou code</em></button>
       <button id="btn-controls" class="menu-item"><i>03</i><span>Commandes &amp; wiki</span><em>Manuel de bord</em></button>
-      <button id="btn-account" class="menu-item"><i>04</i><span>Compte pilote</span><em>Sauvegarde en ligne</em></button>
+      <button id="btn-account" class="menu-item"><i>04</i><span>Compte pilote</span><em>Connexion + sauvegarde auto</em></button>
     </nav>
+    <div class="board" id="board-title"></div>
     <p class="lead">Assemble ton vaisseau module par module, décolle à la main, traverse le vide jusqu'à la Lune et fais trimer ton équipage. Revends à la Bourse. Recommence. Deviens milliardaire.</p>
   </div>
   <aside class="title-keys">
@@ -53,14 +54,14 @@
   <div class="login-card">
     <div class="corp"><span class="corp-logo"></span>SELENE MINING CORP. <em>// Terminal pilote</em></div>
     <h2 class="login-title">Compte pilote</h2>
-    <p class="login-sub">Identifiant + code &agrave; 4 chiffres : ta partie est sauvegard&eacute;e automatiquement sur GitHub et retrouvable depuis n&rsquo;importe quel navigateur.</p>
+    <p class="login-sub">Choisis un identifiant + un code &agrave; 4 chiffres (le compte se cr&eacute;e tout seul la premi&egrave;re fois) : ta partie est sauvegard&eacute;e automatiquement sur GitHub et retrouvable depuis n&rsquo;importe quel navigateur.</p>
     <div id="login-form">
       <label class="login-field"><span>IDENTIFIANT</span><input id="lg-id" maxlength="16" autocomplete="username" spellcheck="false" placeholder="ex : baron-lunaire"></label>
       <label class="login-field"><span>CODE &middot; 4 CHIFFRES</span><input id="lg-pin" type="password" inputmode="numeric" autocomplete="off" maxlength="4" placeholder="&#9679;&#9679;&#9679;&#9679;"></label>
       <div id="login-status" class="login-status"></div>
       <div class="login-btns">
-        <button id="lg-connect" class="btn-primary">Se connecter</button>
-        <button id="lg-create" class="btn">Cr&eacute;er un compte</button>
+        <button id="lg-connect" class="btn-primary">Connexion / Cr&eacute;ation</button>
+        <button id="lg-create" class="btn" hidden>Cr&eacute;er un compte</button>
       </div>
     </div>
     <div id="login-on" class="hidden">
@@ -87,6 +88,7 @@
     <div class="wallet panel"><span class="lbl">Crédits</span><b id="credits" class="num">0</b></div>
     <div class="wallet panel small-w"><span class="lbl">Prestige</span><b id="prestige" class="num">0</b></div>
     <div class="sys-btns">
+      <button class="chip-btn" id="btn-board" title="Classement"><span>🏆 Top 5</span></button>
       <button class="chip-btn" id="btn-save" title="Sauvegarde (P)"><span>Sauver</span><kbd>P</kbd></button>
       <span id="cloud-dot" class="cloud-dot off" title="Sauvegarde en ligne"></span>
       <button class="chip-btn" id="btn-wiki" title="Wiki de bord (H)"><span>Wiki</span><kbd>H</kbd></button>

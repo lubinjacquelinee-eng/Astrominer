@@ -183,7 +183,7 @@ export function buildPartMesh(type, mats, x = 0) {
 export function computeStats(parts) {
   const st = {
     mass: 0, com: new THREE.Vector3(), thrust: 0, vmax: 0, heatGen: 0, fuelUse: 0, fuelCap: 0, cargoCap: 0,
-    crew: 0, airlock: false, gearCount: 0, wings: 0, cool: 3, cockpit: false, agility: 1, spa: false,
+    crew: 0, airlock: false, airlocks: 0, gearCount: 0, wings: 0, cool: 3, cockpit: false, agility: 1, spa: false,
     inertia: 0, thrustCenter: new THREE.Vector3(), engines: 0, cost: 0, lift: 0, grip: 1.1,
     minY: 0, cockpitPos: new THREE.Vector3(0, 0, -1), airlockPos: new THREE.Vector3(),
   };
@@ -196,7 +196,7 @@ export function computeStats(parts) {
     if (d.fuel) st.fuelCap += d.fuel;
     if (d.cargo) st.cargoCap += d.cargo;
     if (d.crew) st.crew += d.crew;
-    if (d.airlock) { st.airlock = true; st.airlockPos.set(p.x, p.y, p.z); }
+    if (d.airlock) { st.airlock = true; st.airlockPos.set(p.x, p.y, p.z); st.airlocks++; }
     if (d.gear) st.gearCount++;
     if (d.grip) { st.wings++; st.grip += d.grip; st.lift += d.lift; }
     if (d.cool) st.cool += d.cool;

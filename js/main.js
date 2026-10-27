@@ -5,6 +5,8 @@ import * as THREE from 'three';
 import { EARTH, MOON, BASE_DIR, PAD_DIR, ORES, ORE_KEYS, SUN_DIR, buildWorld, surfacePoint, localFrame, rng } from './world.js';
 import { PARTS, SHIP_SCALE, makeMaterials, buildPartMesh, computeStats } from './parts.js';
 import { createHangar } from './hangar.js';
+import { createBase, GOODS, IMPORTS, EXPORTS } from './base.js';
+import { cloud, cloudLogin, cloudRegister, cloudResume, cloudPush, cloudPull, cloudLogout } from './cloud.js';
 
 // ---------------- utilitaires ----------------
 const V = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
@@ -20,10 +22,14 @@ const state = {
   credits: 1500, prestige: 0, chrome: false, lux: {},
   cargo: Object.fromEntries(ORE_KEYS.map(k => [k, 0])),
   fuel: 0, heat: 0, hull: 100,
-  upg: { laser: 1, tier: 1, pack: 0, boots: 0, range: 0, drones: 0, rovers: 0, goldsuits: false },
+  upg: { laser: 1, tier: 1, pack: 0, boots: 0, range: 0, drones: 0, rovers: 0, goldsuits: false, brake: 0, whip_ergo: 0, whip_power: 0, whip_dur: 0 },
   colony: { lvl: 0, xp: 0 },
+  freight: {}, base: null, contracts: [], crewXP: {},
   obj: 0, firstLaunch: true, cravacheUsed: false, mined3: false, sold: false, earned: 0,
 };
+
+// sauvegarde automatique : suspendue tant qu'aucune partie n'a commencé ou été chargée
+let saveSuspend = true, autoSaveT = 8;
 const game = {
   state, fmt, toast, sfx, refreshTop,
   launchFromHangar: list => launchFromHangar(list),
@@ -180,25 +186,28 @@ function placeOnRunway() {
   ship.gear = 1; ship.bottom = computeBottom(1);
   ship.pos.copy(ground).addScaledVector(dir, ship.bottom + 0.3);
   ship.vel.set(0, 0, 0); ship.ang.set(0, 0, 0); ship.throttle = 0;
-  ship.landed = true; ship.onGround = true; ship.alive = true; ship.landedAt = 'qg';
+  ship.landed = true; ship.onGround = true; ship.alive = true; ship.landedAt = 'qg'; ship.landedBody = EARTH;
 }
 
 // ---------------- entrées clavier ----------------
 const keys = {};
-const FLIGHT_KEYS = ['a', 'e', 'q', 'd', 'z', 's', ' ', 'x'];
+const FLIGHT_KEYS = ['a', 'e', 'q', 'd', 'z', 's', ' ', 'x', 't', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'];
 addEventListener('keydown', e => {
+  if (e.target && (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT')) return;
   const k = e.key.toLowerCase();
   if (FLIGHT_KEYS.includes(k) || k === 'spacebar') e.preventDefault();
-  if (k === 'escape') { closeModal(); $('#wiki').classList.add('hidden'); }
+  if (k === 'escape') { closeModal(); closeLogin(); $('#wiki').classList.add('hidden'); }
   if (e.repeat) { keys[k] = true; return; }
   keys[k] = true;
   initAudio();
   if (mode !== 'flight') return;
   if (k === 'h') toggleWiki();
+  if (k === 'b' && mode === 'flight') openModal('Base lunaire Selene-1', renderBaseM);
   if (k === 'c') { camMode = camMode === 'chase' ? 'cockpit' : 'chase'; toast(camMode === 'cockpit' ? 'Vue cockpit' : 'Vue poursuite'); }
   if (k === 'm') toggleSound();
   if (k === 'f') cravache();
-  if (k === 'r') recallCrew();
+  if (k === 'r') { if (workers.some(w => w.state !== 'inside')) recallCrew(); else if (ship.landed && ship.landedBody === MOON) deployWorkers(); }
+  if (k === 'p') openSaveMenu();
 });
 addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
@@ -272,6 +281,8 @@ function refreshTop() {
   $('#credits').textContent = fmtBig(state.credits) + ' cr';
   $('#prestige').textContent = fmt(state.prestige);
   const hc = $('#h-credits'); if (hc) hc.textContent = fmtBig(state.credits) + ' cr';
+  const cd = $('#cloud-dot');
+  if (cd) cd.className = 'cloud-dot ' + (!cloud.enabled ? 'off' : !cloud.account ? 'off' : cloud.syncing ? 'sync' : (cloud.conflict || cloud.lastError ? 'err' : 'on'));
 }
 function floater(text, worldPos, color = '#ffb347') {
   const p = worldPos.clone().project(camera); if (p.z > 1) return;
@@ -290,6 +301,7 @@ $('#modal').addEventListener('pointerdown', e => { if (e.target.id === 'modal') 
 $('#wiki').addEventListener('pointerdown', e => { if (e.target.id === 'wiki') $('#wiki').classList.add('hidden'); });
 $('#btn-whip').addEventListener('click', () => cravache());
 $('#btn-recall').addEventListener('click', () => recallCrew());
+$('#btn-deploy').addEventListener('click', () => { if (ship.landed && ship.landedBody === MOON) deployWorkers(); });
 
 let modalRender = null;
 function openModal(title, render) { $('#modal-title').textContent = title; modalRender = render; $('#modal').classList.remove('hidden'); render($('#modal-body')); sfx('click'); }
@@ -319,15 +331,21 @@ function launchFromHangar(design) {
     mode = 'flight'; $('#hud').classList.remove('hidden');
     camYaw = 0; camPitch = 0.12; camSmooth = null;
     if (state.obj === 0) state.obj = 1;
+    saveSuspend = false; // la partie démarre vraiment : autosave actif
+    // emplacement local = compte propriétaire au lancement. Pendant un hold
+    // (changement de compte non résolu), la partie GARDE son propriétaire.
+    if (!cloud.hold) localSlotAccount = cloud.account || 'invite';
+    else if (!localSlotAccount) localSlotAccount = 'invite';
     onResize(); updateDock(); refreshTop();
     toast('Sur la piste. Espace pour accélérer, S pour cabrer.', 'ok');
   });
 }
 
 // ---------------- physique de vol ----------------
-let shake = 0, wasOnGround = false, gearSoundState = 1;
+let shake = 0, wasOnGround = false, gearSoundState = 1, settleT = 0;
 const acc = V(), tmp = V(), tmp2 = V();
-function cargoTotal() { let s = 0; for (const k of ORE_KEYS) s += state.cargo[k]; return s; }
+function cargoTotal() { let s = 0; for (const k of ORE_KEYS) s += state.cargo[k]; for (const k in state.freight) s += state.freight[k] || 0; return s; }
+function cargoSpace() { return Math.max(0, (ship.stats ? ship.stats.cargoCap : 0) - cargoTotal()); }
 
 function physics(dt) {
   const st = ship.stats; const ax = shipAxes();
@@ -341,10 +359,10 @@ function physics(dt) {
   // --- commandes
   let wantThrust = !!keys[' '];
   if (wantThrust && ship.landed && workersOut) { wantThrust = false; if (!recalling) { recallCrew(); } }
-  if (wantThrust && ship.landed) { ship.landed = false; ship.landedAt = null; ship.vel.addScaledVector(near.up, 2.5); onTakeoff(); }
+  if (wantThrust && ship.landed) { ship.departBody = ship.landedBody; ship.landed = false; ship.landedAt = null; ship.vel.addScaledVector(near.up, 2.5); onTakeoff(); }
   ship.throttle = approach(ship.throttle, wantThrust ? 1 : 0, dt * (wantThrust ? 1.4 : 3.2));
-  const inP = (keys['s'] ? 1 : 0) - (keys['z'] ? 1 : 0);
-  const inY = (keys['q'] ? 1 : 0) - (keys['d'] ? 1 : 0);
+  const inP = (keys['s'] || keys['arrowdown'] ? 1 : 0) - (keys['z'] || keys['arrowup'] ? 1 : 0);
+  const inY = (keys['q'] || keys['arrowleft'] ? 1 : 0) - (keys['d'] || keys['arrowright'] ? 1 : 0);
   const inR = (keys['a'] ? 1 : 0) - (keys['e'] ? 1 : 0);
 
   // --- chaleur / carburant
@@ -384,11 +402,12 @@ function physics(dt) {
   if (ship.braking) {
     const sp = ship.vel.length();
     if (sp > 0.01) {
-      const dec = Math.max(accel * 1.6, 45) * dt * (state.fuel > 0 ? 1 : 0.3);
+      const dec = Math.max(accel * 1.6, 45) * brakePower() * dt * (state.fuel > 0 ? 1 : 0.3);
       ship.vel.multiplyScalar(Math.max(0, sp - dec) / sp);
     }
-    state.fuel = Math.max(0, state.fuel - st.fuelUse * 0.6 * dt);
-    state.heat = Math.min(100, state.heat + st.heatGen * 0.35 * dt);
+    const bl = state.upg.brake || 0;
+    state.fuel = Math.max(0, state.fuel - st.fuelUse * 0.6 / (1 + 0.15 * bl) * dt);
+    state.heat = Math.min(100, state.heat + st.heatGen * 0.35 / (1 + 0.2 * bl) * dt);
   }
   // --- dérive / accroche (assistance de trajectoire)
   const speed = ship.vel.length();
@@ -418,7 +437,16 @@ function physics(dt) {
     target.x += -(st.thrustCenter.y - st.com.y) * 0.35 * eff;
     target.y += (st.thrustCenter.x - st.com.x) * 0.35 * eff;
   }
-  const resp = (inP || inY || inR ? 4.2 : 5.5) * Math.sqrt(ag);
+  ship.aligning = false;
+  if (keys['t'] && !ship.onGround && !inP && !inY) {
+    const tgt = alignTarget();
+    const d = tgt.p.clone().sub(ship.pos).normalize().applyQuaternion(ship.quat.clone().invert());
+    const yaw = Math.atan2(-d.x, -d.z), pitch = Math.atan2(d.y, Math.hypot(d.x, d.z));
+    target.x = clamp(pitch * 2.4, -1.5, 1.5) * ag; target.y = clamp(yaw * 2.4, -1.1, 1.1) * ag;
+    if (!inR) target.z = 0;
+    ship.aligning = true;
+  }
+  const resp = (inP || inY || inR || ship.aligning ? 4.2 : 5.5) * Math.sqrt(ag);
   ship.ang.lerp(target, 1 - Math.exp(-resp * dt));
   ship.quat.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(ship.ang.x * dt, ship.ang.y * dt, ship.ang.z * dt, 'YXZ'))).normalize();
 
@@ -461,7 +489,8 @@ function physics(dt) {
     tmp.copy(ship.vel).addScaledVector(up, -ship.vel.dot(up));
     const tl = tmp.length();
     if (!gearDown && tl > 35) damage(tl * 0.04 * dt * 10, 'Raclement de coque');
-    const fr = (gearDown ? 0.35 : 2.2) + (ship.braking ? 2 : 0) + (ship.throttle < 0.05 ? 0.6 : 0);
+    const idle = ship.throttle < 0.05;
+    const fr = (gearDown ? 0.35 : 2.2) + (ship.braking ? 2 * brakePower() : 0) + (idle ? 0.6 : 0) + (idle && tl < 5 ? 5 : 0);
     ship.vel.addScaledVector(tmp, -(1 - Math.exp(-fr * dt)));
     if (!(inP > 0 && ship.throttle > 0.15)) {
       const tq = orientOnSurface(up, ax.fwd);
@@ -469,12 +498,18 @@ function physics(dt) {
     }
     ship.ang.multiplyScalar(0.9);
     ship.onGround = true;
-    if (ship.throttle < 0.05 && ship.vel.length() < 2.2 && !ship.braking) land(near);
+    settleT = (idle && !ship.braking && ship.vel.length() < 6) ? settleT + dt : 0;
+    if (idle && !ship.braking && (ship.vel.length() < 2.2 || settleT > 0.8)) { settleT = 0; land(near); }
   }
   wasOnGround = ship.onGround;
   return { near, dens, accel };
 }
 
+function alignTarget() {
+  const toMoon = (ship.departBody || EARTH) === EARTH;
+  return toMoon ? { p: PAD_DIR.clone().multiplyScalar(MOON.R).add(MOON.c), name: 'COLONIE' } : { p: BASE_DIR.clone().multiplyScalar(EARTH.R).add(EARTH.c), name: 'QG TERRE' };
+}
+function brakePower() { return 1 + 0.6 * (state.upg.brake || 0); }
 function damage(n, why) {
   if (n <= 0) return;
   state.hull = Math.max(0, state.hull - n);
@@ -506,10 +541,30 @@ function land(near) {
   ship.landedBody = near.body;
   toast(atQG ? 'Posé au QG terrestre' : atCol ? 'Posé sur le pad de la colonie lunaire' : near.body === MOON ? 'Posé sur la Lune' : 'Posé sur Terre (hors QG)', 'ok');
   if (near.body === MOON) { if (state.obj === 3) state.obj = 4; deployWorkers(); }
+  if (atCol && !state.seenBase) { state.seenBase = true; setTimeout(() => toast('Bienvenue à Selene-1 : ouvre « Base lunaire » pour bâtir tes modules', 'ok'), 900); }
+  if (atQG && state.sold && !state.seenFret) { state.seenFret = true; setTimeout(() => toast('Nouveau : « Fret & contrats » pour approvisionner la base lunaire', 'ok'), 900); }
   if (atQG && state.obj === 5 && cargoTotal() > 0) { /* vente à faire */ }
   updateDock();
 }
-function onTakeoff() { updateDock(); $('#mining').classList.add('hidden'); }
+function onTakeoff() { updateDock(); }
+let dockSig = '';
+function syncPanels() {
+  // l'affichage des panneaux est recalculé en continu à partir de l'état réel
+  if (mode === 'flight') $('#hud').classList.remove('hidden');
+  const onMoon = mode === 'flight' && ship.alive && ship.landed && ship.landedBody === MOON;
+  $('#mining').classList.toggle('hidden', !onMoon);
+  const sig = mode + '|' + ship.landed + '|' + ship.landedAt;
+  if (sig !== dockSig) { dockSig = sig; updateDock(); }
+  if (onMoon) {
+    const allIn = !workers.length || workers.every(w => w.state === 'inside');
+    const full = ship.stats && cargoTotal() >= ship.stats.cargoCap;
+    const b = $('#btn-deploy'); b.classList.toggle('hidden', !allIn || recalling);
+    b.disabled = !!full || !(ship.stats && ship.stats.airlock);
+    b.querySelector('span').textContent = full ? 'Soute pleine' : workers.length ? 'Redéployer l’équipage' : 'Déployer l’équipage';
+    $('#btn-recall').classList.toggle('hidden', allIn);
+    if (!workers.length) updateMiningUI();
+  }
+}
 
 // ---------------- MINAGE : mineurs, drones, rovers ----------------
 const workers = [];
@@ -567,6 +622,7 @@ function deployWorkers() {
   if (st.cargoCap <= 0) { toast('Aucune soute : impossible de stocker le minerai', 'warn'); }
   despawnWorkers(true); recalling = false;
   const ex = exitPoint();
+  const sas = Math.max(1, st.airlocks || 1); // chaque sas supplémentaire accélère la sortie
   const list = [];
   for (let i = 0; i < st.crew; i++) list.push('miner');
   for (let i = 0; i < state.upg.drones; i++) list.push('drone');
@@ -577,13 +633,13 @@ function deployWorkers() {
     const laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([V(), V()]), new THREE.LineBasicMaterial({ color: kind === 'drone' ? 0xff5ee6 : laserCol, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending }));
     laser.frustumCulled = false; laser.visible = false; scene.add(laser);
     workers.push({
-      kind, ...m, laser, dir: ex.clone(), state: 'wait', delay: i * 0.45, target: null, carry: 0, carryType: null, fatigue: 0, boost: 0, stun: 0, phase: Math.random() * 6,
+      kind, ...m, laser, dir: ex.clone(), state: 'wait', delay: i * 0.45 / sas, target: null, carry: 0, carryType: null, fatigue: 0, boost: 0, stun: 0, phase: Math.random() * 6,
       name: kind === 'miner' ? NAMES[i % NAMES.length] : kind === 'drone' ? `Drone-${i}` : `Rover-${i}`, home: ex.clone(), heading: V(0, 0, -1), idleT: 0,
     });
   });
   $('#mining').classList.remove('hidden');
-  toast(`${list.length} unité(s) sortent du sas`, 'ok');
-  updateMiningUI(true);
+  toast(`${list.length} unité(s) sortent ${sas > 1 ? `des ${sas} sas (débit x${sas})` : 'du sas'}`, 'ok');
+  updateMiningUI(true); updateWhipLabel();
 }
 function despawnWorkers(immediate) {
   for (const w of workers) { scene.remove(w.obj); scene.remove(w.laser); }
@@ -597,6 +653,12 @@ function recallCrew() {
   for (const w of workers) if (w.state !== 'inside') { w.state = 'board'; w.laser.visible = false; }
   toast('Rappel de l’équipage : décollage dès que tout le monde est à bord', 'warn');
 }
+function whipMul() { return 5 + (state.upg.whip_power || 0); }
+function whipDur() { return 0.5 + 0.15 * (state.upg.whip_dur || 0); }
+function whipCost() { return 14 * (1 - 0.12 * (state.upg.whip_ergo || 0)); }
+function updateWhipLabel() { const el = $('#btn-whip .whip-s'); if (el) el.innerHTML = `x${whipMul()} vitesse · ${whipDur().toFixed(2).replace('.', ',')} s · <kbd>F</kbd>`; }
+const RANKS = ['Recrue', 'Mineur', 'Foreur', 'Contremaître', 'Chef de chantier', 'Vétéran', 'Légende lunaire'];
+function crewLevel(name) { return Math.min(RANKS.length - 1, Math.floor(Math.sqrt((state.crewXP[name] || 0) / 40))); }
 function cravache() {
   const active = workers.filter(w => w.kind === 'miner' && w.state !== 'inside' && w.state !== 'stunned' && w.state !== 'wait');
   if (!active.length) return;
@@ -604,9 +666,9 @@ function cravache() {
   state.cravacheUsed = true;
   const btn = $('#btn-whip'); btn.classList.add('hit'); setTimeout(() => btn.classList.remove('hit'), 90);
   for (const w of active) {
-    w.boost = 0.5; w.fatigue += 14;
+    w.boost = whipDur(); w.fatigue += whipCost();
     const p = w.obj.position.clone().addScaledVector(w.dir, 4);
-    floater('x5', p, '#ff6a3d');
+    floater('x' + whipMul(), p, '#ff6a3d');
     burst(w.obj.position, 0xffd23f, 6, 4, sparks);
   }
 }
@@ -662,15 +724,16 @@ function updateWorkers(dt) {
   for (const w of workers) {
     const P = workerParams[w.kind];
     if (w.boost > 0) w.boost -= dt;
-    const boostMul = w.boost > 0 ? 5 : 1;
+    const boostMul = w.boost > 0 ? whipMul() : 1;
+    const crewMul = w.kind === 'miner' ? 1 + 0.07 * crewLevel(w.name) : 1;
     if (w.kind === 'miner') {
-      if (w.boost <= 0) w.fatigue = Math.max(0, w.fatigue - dt * 3.2 * (st.spa ? 3 : 1));
-      if (w.fatigue >= 100 && w.state !== 'stunned') { w.state = 'stunned'; w.stun = 6; w.fatigue = 60; w.laser.visible = false; toast(`${w.name} s’effondre d’épuisement`, 'bad'); sfx('thud'); }
+      if (w.boost <= 0) w.fatigue = Math.max(0, w.fatigue - dt * 6.4 * (st.spa ? 3 : 1) * base.bonus().recov);
+      if (w.fatigue >= 100 && w.state !== 'stunned') { w.state = 'stunned'; w.stun = 6 * base.bonus().stun; w.fatigue = 60; w.laser.visible = false; toast(`${w.name} s’effondre d’épuisement`, 'bad'); sfx('thud'); }
       w.heatMat.emissiveIntensity = clamp((w.fatigue - 40) / 60, 0, 1) * 1.2;
     }
     const fatMul = w.fatigue > 70 ? 0.6 : 1;
     const goldMul = w.kind === 'miner' && state.upg.goldsuits ? 1.25 : 1;
-    const speed = P.speed * (1 + 0.18 * state.upg.boots) * boostMul * fatMul * goldMul * (recalling ? 2 : 1);
+    const speed = P.speed * (1 + 0.18 * state.upg.boots) * boostMul * fatMul * goldMul * crewMul * (recalling ? 2 : 1);
     let moving = false;
     w.laser.visible = false;
     switch (w.state) {
@@ -694,10 +757,15 @@ function updateWorkers(dt) {
         if (w.carryType && w.carryType !== d.type && w.carry > 0) { w.state = 'toShip'; break; }
         anyMining = true;
         const capW = P.cap + state.upg.pack * (w.kind === 'rover' ? 8 : 2);
-        const rate = P.rate * (0.6 + 0.4 * state.upg.laser) * boostMul * fatMul;
+        const rate = P.rate * (0.6 + 0.4 * state.upg.laser) * boostMul * fatMul * crewMul * base.bonus().extract;
         const amt = Math.min(rate * dt, d.amount, capW - w.carry);
         w.carry += amt; d.amount -= amt; w.carryType = d.type;
         state.colony.xp += amt * d.tier;
+        if (w.kind === 'miner') {
+          const before = crewLevel(w.name); state.crewXP[w.name] = (state.crewXP[w.name] || 0) + amt * d.tier;
+          const after = crewLevel(w.name);
+          if (after > before) { toast(`${w.name} monte en grade : ${RANKS[after]} (+${after * 7} % efficacité)`, 'ok'); floater(RANKS[after].toUpperCase(), w.obj.position.clone().addScaledVector(w.dir, 5), '#5dff9e'); sfx('neutral'); }
+        }
         if (d.tier === 3 && amt > 0) state.mined3 = true;
         // laser
         const from = w.gunTip.clone().applyMatrix4(w.obj.matrixWorld);
@@ -799,7 +867,8 @@ function updateMiningUI(force) {
   [...list.querySelectorAll('.crew[data-i]')].forEach(el => {
     const w = workers[+el.dataset.i]; if (!w) return;
     el.querySelector('.fb i').style.width = (w.kind === 'miner' ? w.fatigue : 0) + '%';
-    el.querySelector('.st').textContent = (w.boost > 0 ? 'x5 ' : '') + labels[w.state];
+    el.querySelector('.st').textContent = (w.boost > 0 ? 'x' + whipMul() + ' ' : '') + labels[w.state];
+    if (w.kind === 'miner') { const nm = el.querySelector('.nm'); const r = RANKS[crewLevel(w.name)]; if (nm.dataset.r !== r) { nm.dataset.r = r; nm.innerHTML = `${w.name}<small>${r}</small>`; } }
     el.classList.toggle('hot', w.fatigue > 70);
   });
   const cap = ship.stats ? ship.stats.cargoCap : 0;
@@ -812,7 +881,7 @@ function updateMiningUI(force) {
 const COLONY_XP = lvl => 80 * Math.pow(1.6, lvl);
 function updateDeposits(dt) {
   for (const d of W.deposits) {
-    if (d.amount < d.max) d.amount = Math.min(d.max, d.amount + d.max * 0.0035 * dt);
+    if (d.amount < d.max) d.amount = Math.min(d.max, d.amount + d.max * 0.007 * dt); // régénération x2
     const k = clamp(d.amount / d.max, 0, 1);
     const s = k < 0.01 ? 0.001 : 0.25 + 0.75 * k;
     for (const c of d.crystals) c.scale.x = c.scale.z = s, c.scale.y = s * (c.userData.sy || (c.userData.sy = c.scale.y / Math.max(s, 0.001), c.userData.sy));
@@ -918,7 +987,7 @@ function drawChart(cv, k) {
   h.forEach((v, i) => { const x = i / (h.length - 1) * w, y = ht - (v - mn) / (mx - mn) * ht; i ? c.lineTo(x, y) : c.moveTo(x, y); });
   c.strokeStyle = col; c.lineWidth = 2.5; c.stroke();
   c.lineTo(w, ht); c.lineTo(0, ht); c.closePath(); c.fillStyle = grad; c.fill();
-  c.fillStyle = '#e6edf6'; c.font = '600 14px JetBrains Mono, monospace';
+  c.fillStyle = '#e6edf6'; c.font = '600 15px "Share Tech Mono", monospace';
   c.fillText(`${ORES[k].name} · ${fmt(price(k))} cr/u`, 10, 20);
 }
 
@@ -930,6 +999,14 @@ const UPGRADES = [
   { id: 'range', name: 'Balises de rayon', desc: lv => `Rayon de minage : ${110 + lv * 40} m`, cost: lv => 500 * Math.pow(2.3, lv), max: 8 },
   { id: 'drones', name: 'Drone de minage', desc: lv => `${lv} drone(s) volant(s), sans fatigue`, cost: lv => 3500 * Math.pow(2.2, lv), max: 6 },
   { id: 'rovers', name: 'Rover de transport', desc: lv => `${lv} rover(s), charge 28 u`, cost: lv => 25000 * Math.pow(2.6, lv), max: 3 },
+];
+const SHIP_UPGRADES = [
+  { id: 'brake', name: 'Rétro-freins renforcés (X)', desc: lv => `Puissance de freinage x${(1 + 0.6 * lv).toFixed(1)} · conso -${Math.round((1 - 1 / (1 + 0.15 * lv)) * 100)} %`, cost: lv => 450 * Math.pow(2.3, lv), max: 10 },
+];
+const WHIP_UPGRADES = [
+  { id: 'whip_ergo', name: 'Poignée ergonomique', desc: lv => `Fatigue par coup : ${Math.round(14 * (1 - 0.12 * lv))} %`, cost: lv => 600 * Math.pow(2.4, lv), max: 5 },
+  { id: 'whip_power', name: 'Électro-cravache', desc: lv => `Boost x${5 + lv}`, cost: lv => 1500 * Math.pow(2.7, lv), max: 5 },
+  { id: 'whip_dur', name: 'Mégaphone motivant', desc: lv => `Durée du boost : ${(0.5 + 0.15 * lv).toFixed(2).replace('.', ',')} s`, cost: lv => 1000 * Math.pow(2.5, lv), max: 5 },
 ];
 const TIERS = [
   { tier: 2, name: 'Laser Cuprum (Tier 2)', desc: 'Débloque Titane et Cuprum (anneau à ~250-500 m de la colonie).', cost: 6000 },
@@ -950,6 +1027,16 @@ function renderShop(body) {
     const owned = state.upg.tier >= t.tier, locked = state.upg.tier < t.tier - 1;
     h += `<div class="row"><div><div class="t">${t.name}</div><div class="d">${t.desc}</div></div><div class="v">${owned ? 'Acquis' : fmtBig(t.cost) + ' cr'}</div><button class="btn" data-tier="${t.tier}" ${owned || locked || state.credits < t.cost ? 'disabled' : ''}>${owned ? '✓' : locked ? 'Verrouillé' : 'Acheter'}</button></div>`;
   }
+  h += '<div class="section-t">Vaisseau</div>';
+  for (const u of SHIP_UPGRADES) {
+    const lv = state.upg[u.id] || 0; const c = u.cost(lv); const maxed = lv >= u.max;
+    h += `<div class="row"><div><div class="t">${u.name} <span class="tier t1">niv. ${lv}</span></div><div class="d">${u.desc(lv)}${maxed ? '' : ' → ' + u.desc(lv + 1)}</div></div><div class="v">${maxed ? 'MAX' : fmtBig(c) + ' cr'}</div><button class="btn" data-up="${u.id}" ${maxed || state.credits < c ? 'disabled' : ''}>Acheter</button></div>`;
+  }
+  h += '<div class="section-t">Cravache</div>';
+  for (const u of WHIP_UPGRADES) {
+    const lv = state.upg[u.id] || 0; const c = u.cost(lv); const maxed = lv >= u.max;
+    h += `<div class="row"><div><div class="t">${u.name} <span class="tier t2">niv. ${lv}</span></div><div class="d">${u.desc(lv)}${maxed ? '' : ' → ' + u.desc(lv + 1)}</div></div><div class="v">${maxed ? 'MAX' : fmtBig(c) + ' cr'}</div><button class="btn" data-up="${u.id}" ${maxed || state.credits < c ? 'disabled' : ''}>Acheter</button></div>`;
+  }
   h += '<div class="section-t">Équipage &amp; équipements</div>';
   for (const u of UPGRADES) {
     const lv = state.upg[u.id]; const c = u.cost(lv); const maxed = lv >= u.max;
@@ -958,8 +1045,8 @@ function renderShop(body) {
   h += '<p class="d" style="color:var(--muted);font-size:12px">Les moteurs, réservoirs et soutes avancés s’achètent directement au Hangar.</p>';
   body.innerHTML = h;
   body.querySelectorAll('[data-up]').forEach(b => b.addEventListener('click', () => {
-    const u = UPGRADES.find(x => x.id === b.dataset.up); const c = u.cost(state.upg[u.id]);
-    if (state.credits < c) return; state.credits -= c; state.upg[u.id]++; sfx('coin'); refreshTop(); rerenderModal();
+    const u = UPGRADES.concat(SHIP_UPGRADES, WHIP_UPGRADES).find(x => x.id === b.dataset.up); const c = u.cost(state.upg[u.id] || 0);
+    if (state.credits < c) return; state.credits -= c; state.upg[u.id] = (state.upg[u.id] || 0) + 1; sfx('coin'); toast(`${u.name} : niveau ${state.upg[u.id]}`, 'ok'); updateWhipLabel(); refreshTop(); rerenderModal();
   }));
   body.querySelectorAll('[data-tier]').forEach(b => b.addEventListener('click', () => {
     const t = TIERS.find(x => x.tier === +b.dataset.tier); if (state.credits < t.cost) return;
@@ -1009,6 +1096,16 @@ function renderColony(body) {
   if (b) b.onclick = () => { if (state.credits < inv) return; state.credits -= inv; c.xp = COLONY_XP(c.lvl) + 0.01; sfx('coin'); refreshTop(); setTimeout(() => renderColony(body), 50); };
 }
 
+const renderBaseM = body => base.renderBase(body);
+const renderFret = body => base.renderFret(body);
+const base = createBase({
+  scene, state, toast, sfx, fmt, fmtBig, refreshTop,
+  cargoSpace, rerender: () => rerenderModal(), modalOpen: () => modalRender === renderBaseM && !$('#modal').classList.contains('hidden') && !(document.activeElement && /INPUT|TEXTAREA/.test(document.activeElement.tagName)),
+  atColony: () => mode === 'flight' && ship.landed && ship.landedAt === 'colony',
+  fuelNeed: () => ship.stats ? Math.max(0, Math.floor(ship.stats.fuelCap - state.fuel)) : 0,
+  addFuel: q => { state.fuel += q; },
+  renderCore: el => renderColony(el), onSale: () => afterSale(),
+});
 function updateDock() {
   const dock = $('#dock'); dock.innerHTML = '';
   if (mode !== 'flight' || !ship.landed) return;
@@ -1019,15 +1116,267 @@ function updateDock() {
     add('Bourse', () => openModal('Bourse Terre-Lune', renderBourse));
     add('Ravitaillement', () => openModal('Ravitaillement & atelier', b => renderRefuel(b, false)));
     add('Boutique', () => openModal('Boutique industrielle', renderShop));
+    add('Fret & contrats', () => openModal('Fret Terre-Lune & contrats', renderFret));
     add('Luxe', () => openModal('Galerie du luxe', renderLux));
   } else if (ship.landedAt === 'colony' || ship.landedAt === 'moon') {
     const l = document.createElement('span'); l.className = 'dock-lbl'; l.textContent = ship.landedAt === 'colony' ? 'COLONIE LUNAIRE' : 'SURFACE LUNAIRE'; dock.appendChild(l);
     if (ship.landedAt === 'colony') {
-      add('Colonie', () => openModal('Colonie lunaire', renderColony));
+      add('Base lunaire', () => openModal('Base lunaire Selene-1', renderBaseM), 'main');
       add('Ravitaillement lunaire', () => openModal('Station-service lunaire', b => renderRefuel(b, true)));
     }
   }
 }
+
+// ---------------- SAUVEGARDES ----------------
+function makeSave() {
+  const design = mode === 'hangar' ? hangar.getDesign() : (ship.design || hangar.getDesign());
+  // minerai sur le dos des mineurs : conservé pour ne rien perdre au chargement
+  const carried = {};
+  for (const w of workers) if (w.carry > 0.01 && w.carryType) carried[w.carryType] = (carried[w.carryType] || 0) + w.carry;
+  return {
+    v: 1, t: Date.now() + (cloud.offset || 0) + 5, state: JSON.parse(JSON.stringify(state)), design, carried,
+    market: Object.fromEntries(ORE_KEYS.map(k => [k, +market[k].mult.toFixed(4)])),
+    dep: W.deposits.map(d => Math.round(d.amount * 10) / 10),
+  };
+}
+function encodeSave(o) { return 'AM1.' + btoa(unescape(encodeURIComponent(JSON.stringify(o)))); }
+function decodeSave(txt) {
+  let t = String(txt || '').trim(); if (!t) throw new Error('vide');
+  if (t.startsWith('{')) return JSON.parse(t);
+  if (t.startsWith('AM1.')) t = t.slice(4);
+  return JSON.parse(decodeURIComponent(escape(atob(t.replace(/\s+/g, '')))));
+}
+function applySave(o) {
+  if (!o || !o.state || !Array.isArray(o.design)) throw new Error('format');
+  const s = o.state;
+  for (const k of Object.keys(state)) {
+    if (!(k in s)) continue;
+    if (state[k] && typeof state[k] === 'object' && !Array.isArray(state[k]) && k !== 'lux') Object.assign(state[k], s[k]);
+    else state[k] = s[k];
+  }
+  state.lux = s.lux || {};
+  if (Array.isArray(s.contracts)) state.contracts = s.contracts;
+  if (s.base) state.base = JSON.parse(JSON.stringify(s.base));
+  if (s.freight) state.freight = { ...s.freight };
+  state.crewXP = s.crewXP || {};
+  if (o.carried) for (const k in o.carried) state.cargo[k] = (state.cargo[k] || 0) + o.carried[k]; // minerai porté par les mineurs
+  base.ensureState(); base.rebuildAll(); updateWhipLabel();
+  if (o.market) for (const k of ORE_KEYS) if (o.market[k]) { market[k].mult = o.market[k]; market[k].hist = Array(80).fill(price(k)); }
+  if (Array.isArray(o.dep)) W.deposits.forEach((d, i) => { if (typeof o.dep[i] === 'number') d.amount = clamp(o.dep[i], 0, d.max); });
+  W.colony.stages.forEach((st, i) => { st.visible = i < state.colony.lvl; st.userData.grow = 1; st.scale.setScalar(1); });
+  for (const id in W.qg.lux) W.qg.lux[id].visible = !!state.lux[id];
+  state.upg.goldsuits = !!state.lux.goldsuits;
+  despawnWorkers(true); recalling = false;
+  ship.design = o.design.filter(p => PARTS[p.type]);
+  hangar.rebuildMaterials(); hangar.loadDesign(ship.design);
+  closeModal();
+  fadeTo(() => { $('#title').classList.add('hidden'); openHangar(); saveSuspend = false; localSlotAccount = cloud.account || 'invite'; toast('Partie chargée. Ton vaisseau t’attend au hangar.', 'ok'); });
+}
+// Charge une partie distante : ne lève les protections (conflit / hold) qu'une
+// fois la sauvegarde réellement appliquée — si le chargement échoue, on garde
+// la protection active pour ne pas risquer d'écraser la version distante.
+async function applyCloudSave(save) {
+  saveSuspend = true; // suspendu pendant le chargement
+  try {
+    applySave(save);
+    cloud.conflict = false; cloud.hold = false;
+    localSlotAccount = cloud.account;
+  } catch (x) {
+    saveSuspend = false;
+    toast('Sauvegarde cloud illisible', 'bad');
+    throw x;
+  }
+}
+function saveFileName() { const d = new Date(); const p = n => String(n).padStart(2, '0'); return `astro-mineur_${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}h${p(d.getMinutes())}.json`; }
+function renderSave(body) {
+  const inGame = mode !== 'title';
+  const code = inGame ? encodeSave(makeSave()) : '';
+  let h = '';
+  // --- compte pilote (cloud) ---
+  h += '<div class="section-t">Compte pilote (sauvegarde en ligne)</div>';
+  if (!cloud.enabled) {
+    h += '<div class="news wrap warn-n">Sauvegarde en ligne non configurée (guide : cloud/README.md). La sauvegarde automatique locale reste active.</div>';
+  } else if (cloud.account) {
+    const last = cloud.lastSync ? new Date(cloud.lastSync).toLocaleString('fr-FR') : '—';
+    h += `<div class="row"><div><div class="t">Connecté : ${cloud.account}</div><div class="d">Sauvegarde automatique sur GitHub toutes les 20 s · dernière synchro : ${last}${cloud.syncing ? ' · envoi en cours…' : ''}</div></div><div class="v"></div><button class="btn" id="sv-logout">Quitter le compte</button></div>`;
+    if (cloud.conflict) {
+      h += `<div class="news wrap warn-n">Conflit : une version plus récente existe sur le cloud.</div>`;
+    } else if (cloud.hold) {
+      h += `<div class="news wrap warn-n">La partie en cours et le compte « ${cloud.account} » ne correspondent pas.</div>`;
+    }
+    if (cloud.conflict || cloud.hold) {
+      h += `<div class="row"><div><div class="t">Charger la version cloud</div><div class="d">Remplace la partie en cours par la version distante.</div></div><div class="v"></div><button class="btn" id="sv-pull">Charger</button></div>
+        <div class="row"><div><div class="t">Écraser le cloud</div><div class="d">Fait de la partie locale la version de référence.</div></div><div class="v"></div><button class="btn" id="sv-force">Écraser</button></div>`;
+    } else {
+      h += `<div class="row"><div><div class="t">Envoyer maintenant</div><div class="d">Sauvegarde immédiate de la partie sur GitHub.</div></div><div class="v"></div><button class="btn" id="sv-push" ${inGame ? '' : 'disabled'}>Envoyer</button></div>`;
+    }
+  } else {
+    h += '<div class="row"><div><div class="t">Compte pilote</div><div class="d">Identifiant + code à 4 chiffres : ta partie stockée sur GitHub, retrouvable depuis n’importe quel navigateur.</div></div><div class="v"></div><button class="btn" id="sv-login">Se connecter / créer un compte</button></div>';
+  }
+  // --- sauvegarde automatique locale ---
+  h += '<div class="section-t">Sauvegarde automatique locale</div>';
+  let localInfo = null;
+  try { const raw = localStorage.getItem(localSlot()); if (raw) localInfo = decodeSave(raw); } catch (e) {}
+  if (localInfo && localInfo.t) {
+    h += `<div class="row"><div><div class="t">Dernière sauvegarde auto</div><div class="d">${new Date(localInfo.t).toLocaleString('fr-FR')} · ${fmtBig(localInfo.state.credits)} cr · colonie niv. ${localInfo.state.colony.lvl}</div></div><div class="v"></div><button class="btn" id="sv-auto">Charger</button></div>`;
+  } else {
+    h += '<div class="news wrap">Aucune sauvegarde automatique locale pour l’instant. En jeu : sauvegarde toutes les 20 s, même hors ligne.</div>';
+  }
+  // --- manuel ---
+  h += `${inGame ? `<div class="save-summary"><div><span>Crédits</span><b class="num">${fmtBig(state.credits)} cr</b></div><div><span>Prestige</span><b class="num">${fmt(state.prestige)}</b></div><div><span>Colonie</span><b class="num">niv. ${state.colony.lvl}</b></div><div><span>Palier laser</span><b class="num">T${state.upg.tier}</b></div></div>
+    <div class="section-t">Enregistrer</div>
+    <div class="row"><div><div class="t">Fichier de sauvegarde</div><div class="d">Télécharge la partie (crédits, améliorations, colonie, vaisseau, marché) dans un fichier .json.</div></div><div class="v"></div><button class="btn" id="sv-dl">Télécharger</button></div>
+    <div class="row"><div><div class="t">Code de sauvegarde</div><div class="d">Copie ce code et garde-le où tu veux. Il contient toute ta progression.</div></div><div class="v"></div><button class="btn" id="sv-copy">Copier le code</button></div>
+    <textarea id="sv-code" class="code" readonly spellcheck="false">${code}</textarea>` : ''}
+    <div class="section-t">Charger une partie</div>
+    <div class="row"><div><div class="t">Depuis un fichier</div><div class="d">Sélectionne un fichier .json exporté depuis Astro-Mineur.</div></div><div class="v"></div><label class="btn">Choisir un fichier<input type="file" id="sv-file" accept=".json,application/json,text/plain" hidden></label></div>
+    <textarea id="sv-in" class="code" placeholder="…ou colle ici un code de sauvegarde (AM1.…)" spellcheck="false"></textarea>
+    <button class="btn-primary" id="sv-load">Charger ce code</button>
+    <p class="note">Sauvegarde automatique : locale toutes les 20 s, cloud toutes les 20 s si un compte pilote est connecté. Charger une partie remplace la progression en cours.</p>`;
+  body.innerHTML = h;
+  const err = m => toast(m, 'bad');
+  const lg = body.querySelector('#sv-login'); if (lg) lg.onclick = () => { closeModal(); openLogin(); };
+  const lo = body.querySelector('#sv-logout'); if (lo) lo.onclick = () => { cloudLogout(); refreshTop(); toast('Déconnecté. Sauvegarde locale automatique maintenue.', 'ok'); rerenderModal(); };
+  const pu = body.querySelector('#sv-pull'); if (pu) pu.onclick = async () => { try { const d = await cloudPull(); if (d && d.save) await applyCloudSave(d.save); else toast('Aucune partie cloud', 'warn'); } catch (e) { toast(e.message, 'bad'); } };
+  const fo = body.querySelector('#sv-force'); if (fo) fo.onclick = () => autoSaveCloud({ force: true, manual: true });
+  const ps = body.querySelector('#sv-push'); if (ps) ps.onclick = () => autoSaveCloud({ manual: true });
+  const au = body.querySelector('#sv-auto'); if (au) au.onclick = () => { try { applySave(decodeSave(localStorage.getItem(localSlot()))); } catch (x) { toast('Sauvegarde automatique illisible', 'bad'); } };
+  const dl = body.querySelector('#sv-dl');
+  if (dl) dl.onclick = () => {
+    try {
+      const blob = new Blob([JSON.stringify(makeSave())], { type: 'application/json' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = saveFileName();
+      document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+      sfx('coin'); toast('Fichier de sauvegarde téléchargé', 'ok');
+    } catch (e) { err('Téléchargement bloqué : utilise le code de sauvegarde'); }
+  };
+  const cp = body.querySelector('#sv-copy');
+  if (cp) cp.onclick = async () => {
+    const ta = body.querySelector('#sv-code');
+    try { await navigator.clipboard.writeText(ta.value); toast('Code copié dans le presse-papiers', 'ok'); }
+    catch (e) { ta.focus(); ta.select(); let ok = false; try { ok = document.execCommand('copy'); } catch (_) {} toast(ok ? 'Code copié' : 'Code sélectionné : fais Ctrl+C pour le copier', ok ? 'ok' : 'warn'); }
+    sfx('click');
+  };
+  body.querySelector('#sv-file').onchange = e => {
+    const f = e.target.files && e.target.files[0]; if (!f) return;
+    const r = new FileReader();
+    r.onload = () => { try { applySave(decodeSave(r.result)); } catch (x) { err('Fichier de sauvegarde illisible'); } };
+    r.readAsText(f);
+  };
+  body.querySelector('#sv-load').onclick = () => { try { applySave(decodeSave(body.querySelector('#sv-in').value)); } catch (x) { err('Code de sauvegarde invalide'); } };
+}
+function openSaveMenu() { openModal(mode === 'title' ? 'Charger une partie' : 'Sauvegarde', renderSave); }
+$('#btn-save').addEventListener('click', openSaveMenu);
+$('#btn-load').addEventListener('click', () => { initAudio(); openSaveMenu(); });
+$('#btn-controls').addEventListener('click', () => toggleWiki());
+$('#h-save').addEventListener('click', openSaveMenu);
+
+// ---------------- COMPTE PILOTE (CLOUD) ----------------
+// compte propriétaire de la partie en cours : l'emplacement de sauvegarde
+// locale ne suit PAS un changement de compte tant que le joueur n'a pas
+// choisi de récupérer la partie du compte ou d'envoyer celle en cours.
+let localSlotAccount = null;
+function localSlot() { return 'am2-auto-' + ((localSlotAccount || cloud.account) || 'invite').toLowerCase(); }
+function autoSaveLocal() {
+  if (mode === 'title') return;
+  try { localStorage.setItem(localSlot(), encodeSave(makeSave())); } catch (e) {}
+}
+function autoSaveCloud(opts = {}) {
+  if (mode === 'title' || !cloud.enabled || !cloud.account || cloud.busy || cloud.syncing) return;
+  if ((cloud.conflict || cloud.hold) && !opts.force) {
+    if (opts.manual) toast(cloud.conflict ? 'Conflit cloud : une version plus récente existe. Menu Sauver (P) pour choisir.' : 'Compte connecté — menu Sauver (P) pour récupérer ou envoyer la partie.', 'warn');
+    return;
+  }
+  const owner = cloud.account, gen0 = cloud.gen; // identité et génération visées par cet envoi
+  cloudPush(makeSave(), opts).then(() => {
+    // réponse d'actualité seulement : si le joueur a changé de compte ou chargé
+    // une autre partie entre-temps, le propriétaire local ne doit pas bouger.
+    if (cloud.gen === gen0) localSlotAccount = owner;
+    refreshTop();
+    if (opts.manual) toast('Partie envoyée sur GitHub', 'ok');
+  }).catch(e => {
+    refreshTop();
+    if (cloud.conflict) toast('Conflit cloud : une version plus récente existe. Menu Sauver (P) pour choisir.', 'warn');
+    else if (e.status === 429) toast('Cloud : trop d’envois, nouvel essai plus tard', 'warn');
+    else if (opts.manual) toast('Cloud inaccessible : ' + e.message, 'bad');
+  });
+}
+function autoSave() {
+  if (saveSuspend) return;
+  autoSaveLocal();
+  autoSaveCloud();
+}
+addEventListener('beforeunload', () => { if (!saveSuspend) { autoSaveLocal(); autoSaveCloud({ keepalive: true }); } });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && !saveSuspend) autoSave(); });
+
+// écran de connexion
+function refreshLoginView() {
+  const form = $('#login-form'), on = $('#login-on'), note = $('#lg-note');
+  if (!cloud.enabled) {
+    form.classList.add('hidden'); on.classList.add('hidden');
+    if (note) note.innerHTML = 'Sauvegarde en ligne non configurée.<br>Suis le guide <b>cloud/README.md</b> pour l’activer — la sauvegarde automatique locale fonctionne déjà.';
+    return;
+  }
+  note.innerHTML = '';
+  if (cloud.account) {
+    form.classList.add('hidden'); on.classList.remove('hidden');
+    $('#lg-name').textContent = cloud.account;
+    $('#lg-last').textContent = cloud.lastSync ? new Date(cloud.lastSync).toLocaleString('fr-FR') : '—';
+    const play = $('#lg-play');
+    play.textContent = mode === 'title' ? 'Reprendre ma partie' : 'Charger la partie cloud (remplace la partie en cours)';
+  } else {
+    on.classList.add('hidden'); form.classList.remove('hidden');
+  }
+}
+function openLogin() { refreshLoginView(); $('#login').classList.remove('hidden'); const el = $('#lg-id'); if (el && !cloud.account) setTimeout(() => el.focus(), 50); }
+function closeLogin() { $('#login').classList.add('hidden'); }
+$('#btn-account').addEventListener('click', () => { initAudio(); openLogin(); });
+$('#lg-close').addEventListener('click', closeLogin);
+$('#login').addEventListener('pointerdown', e => { if (e.target.id === 'login') closeLogin(); });
+$('#lg-out').addEventListener('click', () => { cloudLogout(); refreshLoginView(); refreshTop(); toast('Déconnecté. Sauvegarde locale automatique maintenue.', 'ok'); });
+$('#lg-connect').addEventListener('click', async () => {
+  const id = $('#lg-id').value.trim(), pin = $('#lg-pin').value.trim();
+  const st = $('#login-status');
+  st.textContent = 'Connexion…';
+  try {
+    const d = await cloudLogin(id, pin, { hold: mode !== 'title' });
+    st.textContent = '';
+    refreshLoginView(); refreshTop();
+    sfx('coin');
+    if (mode !== 'title') toast(`Connecté : ${id}. Menu Sauver (P) pour récupérer la partie du compte ou envoyer celle en cours.`, 'warn');
+    else toast(d && d.save ? `Connecté : ${id}. Clique sur « Reprendre ma partie ».` : `Connecté : ${id}. Compte neuf, aucune partie cloud.`, 'ok');
+  } catch (e) { st.textContent = e.message; }
+});
+$('#lg-create').addEventListener('click', async () => {
+  const id = $('#lg-id').value.trim(), pin = $('#lg-pin').value.trim();
+  const st = $('#login-status');
+  st.textContent = 'Création du compte…';
+  try {
+    const saveObj = (mode !== 'title' && !saveSuspend) ? makeSave() : null;
+    await cloudRegister(id, pin, saveObj);
+    st.textContent = '';
+    if (mode !== 'title') localSlotAccount = id; // compte créé avec la partie en cours
+    refreshLoginView(); refreshTop();
+    sfx('coin');
+    toast(`Compte créé : ${id}. Sauvegarde automatique sur GitHub activée.`, 'ok');
+  } catch (e) { st.textContent = e.message; }
+});
+$('#lg-play').addEventListener('click', async () => {
+  const st = $('#login-status');
+  st.textContent = 'Récupération de la partie…';
+  try {
+    const d = await cloudPull();
+    st.textContent = '';
+    if (!d || !d.save) { st.textContent = 'Aucune partie enregistrée pour ce compte.'; return; }
+    closeLogin();
+    try { await applyCloudSave(d.save); } catch (x) {}
+  } catch (e) { st.textContent = e.message; }
+});
+$('#lg-pin').addEventListener('input', e => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, 4); });
+$('#lg-pin').addEventListener('keydown', e => { if (e.key === 'Enter') $('#lg-connect').click(); });
+$('#lg-id').addEventListener('keydown', e => { if (e.key === 'Enter') $('#lg-pin').focus(); });
+// reconnexion silencieuse si une session existe
+if (cloud.enabled) cloudResume().then(() => { refreshTop(); });
 
 // ---------------- OBJECTIFS ----------------
 const OBJECTIVES = [
@@ -1212,8 +1561,9 @@ function updateHUD(dt, info) {
   const ct = cargoTotal(); $('#b-cargo').style.width = (st.cargoCap ? ct / st.cargoCap * 100 : 0) + '%'; $('#t-cargo').textContent = `${Math.floor(ct)}/${st.cargoCap}`;
   const tg = $('#tag-gear'); tg.className = 'tag ' + (ship.gear > 0.95 ? 'on' : ship.gear > 0.02 ? 'warn' : ''); tg.textContent = ship.gear > 0.95 ? 'TRAIN SORTI' : ship.gear > 0.02 ? 'TRAIN…' : 'TRAIN RENTRÉ';
   const gr = $('#tag-grav'); const g = near.body.g0 * Math.pow(near.body.R / near.dist, 2); gr.textContent = `G ${near.body.name.toUpperCase()} ${g.toFixed(1).replace('.', ',')}`; gr.className = 'tag ' + (g > 0.5 ? 'warn' : '');
-  $('#tag-brake').className = 'tag ' + (ship.braking ? 'bad' : '');
+  $('#tag-brake').className = 'tag ' + (ship.braking ? 'bad' : ''); $('#tag-brake').textContent = 'RÉTRO MK' + (1 + (state.upg.brake || 0));
   $('#tag-assist').className = 'tag on';
+  { const ta = $('#tag-align'); const nm = 'T → ' + alignTarget().name; if (ta.textContent !== nm) ta.textContent = nm; ta.className = 'tag ' + (ship.aligning ? 'on' : ''); }
   $('#loc-label').textContent = ship.landed ? (ship.landedAt === 'qg' ? 'QG Terre' : ship.landedAt === 'colony' ? 'Colonie lunaire' : ship.landedAt === 'moon' ? 'Surface lunaire' : 'Terre') : (info.dens > 0 ? 'Atmosphère' : near.body === MOON && near.alt < 1500 ? 'Orbite lunaire' : 'Espace profond');
   // alertes
   const al = [];
@@ -1229,6 +1579,7 @@ function updateHUD(dt, info) {
   refreshTop();
   updateObjectives(info);
   miningUIt -= 0.08; if (workers.length) updateMiningUI();
+  syncPanels();
 }
 
 // ---------------- ciel / atmosphère ----------------
@@ -1278,8 +1629,10 @@ addEventListener('resize', onResize); onResize();
 function frame() {
   requestAnimationFrame(frame);
   const dt = Math.min(clock.getDelta(), 0.05);
+  autoSaveT -= dt; if (autoSaveT <= 0) { autoSaveT = 20; autoSave(); }
   updateMarket(dt);
   updateColony(dt);
+  base.tick(dt); base.animate(dt, clock.elapsedTime);
   updateDeposits(dt);
   if (mode === 'hangar') {
     hangar.update(dt); refreshTop();
@@ -1313,4 +1666,4 @@ refreshTop();
 frame();
 
 // accès debug pour tests
-window.__game = { THREE, MOON, PAD_DIR, orientOnSurface, state, ship, keys, workers, W, market, openHangar, deployWorkers, get mode() { return mode; } };
+window.__game = { THREE, MOON, PAD_DIR, orientOnSurface, state, ship, keys, workers, W, market, openHangar, deployWorkers, makeSave, applySave, cloud, autoSaveCloud, autoSaveLocal, get mode() { return mode; }, get slotAccount() { return localSlotAccount; } };

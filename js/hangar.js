@@ -229,6 +229,7 @@ export function createHangar(renderer, game) {
         <div><span>Refroid.</span><b class="num">${st.cool.toFixed(0)} / ${st.heatGen.toFixed(0)}</b></div>
         <div><span>Soute</span><b class="num">${st.cargoCap} u</b></div>
         <div><span>Mineurs</span><b class="num">${st.crew}</b></div>
+        <div><span>Sas</span><b class="num">${st.airlocks}${st.airlocks > 1 ? ' (sortie x' + st.airlocks + ')' : ''}</b></div>
         <div><span>Déséquilibre</span><b class="num ${off > 0.6 ? 'bad' : ''}">${off.toFixed(2)}</b></div>
         <div><span>Valeur</span><b class="num">${game.fmt(st.cost)} cr</b></div>
       </div>
